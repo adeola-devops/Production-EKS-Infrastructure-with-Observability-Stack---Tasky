@@ -1,0 +1,12 @@
+variable "project_name" {}
+variable "subnet_ids" {}
+variable "eks_role_arn" {}
+variable "eks_cluster_policy_attachment_id" {}
+variable "worker_node_policy" {}
+variable "cni_policy" {}
+variable "ecr_readonly" {}
+variable "node_role_arn" {}
+variable "cluster_autoscaler_role" {}
+variable "instance_type" {}
+variable "volume_size" {}
+variable "cluster_autoscaler_role_arn" {}

@@ -1,0 +1,10 @@
+variable "ami" {}
+variable "instance_type" {}
+variable "volume_size" {}
+variable "subnet_id" {}
+variable "security_groups" {}
+variable "key_name" {}
+variable "user_data" {}
+variable "iam_instance_profile" {}
+variable "project_name" {}
+variable "associate_public_ip_address" {}

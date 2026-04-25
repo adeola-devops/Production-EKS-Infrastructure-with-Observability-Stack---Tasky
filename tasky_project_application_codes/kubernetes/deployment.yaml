@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tasky-deployment
+  namespace: production
+  labels:
+    app: tasky
+    type: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels: 
+      app: tasky
+      type: frontend
+  template:
+    metadata:
+      labels:
+        app: tasky
+        type: frontend
+    spec:
+      containers:
+      - name: tasky-container
+        image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_REPOSITORY_NAME}:${BITBUCKET_TAG}
+        ports:
+          - containerPort: 8080
+
+        env:
+          - name: MONGODB_URI
+            valueFrom:
+              secretKeyRef:
+                name: mongodb-user
+                key: MONGODB_URI
+
+
+  # annotations:
+  #   service.beta.kubernetes.io/aws-load-balancer-type: "Internet-facing"
+  #   service.beta.kubernetes.io/aws-load-balancer-ssl-cert: ${ACM_CERT_ARN}
+  #   service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+  #   service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "http"
+    # type: LoadBalancer
+    # - name: https
+  #   protocol: TCP
+  #   port: 443
+  #   targetPort: 8000
+    # - name: https
+  #   protocol: TCP
+  #   port: 443
+  #   targetPort: 5000
+  

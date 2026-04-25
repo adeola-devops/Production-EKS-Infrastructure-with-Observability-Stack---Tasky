@@ -1,0 +1,229 @@
+options:
+  max-time: 60
+
+definitions:
+  steps:
+    - step: &trivy-scan
+        name: Trivy Scan
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Running Trivy scan"
+          - trivy fs . --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1
+
+    - step: &gitleaks-scan
+        name: GitLeaks Secret Scan
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Running GitLeaks secrets scan"
+          - |
+              cd $BITBUCKET_CLONE_DIR
+              gitleaks detect \
+                --source . \
+                --no-git \
+                --redact \
+                --verbose \
+                --exit-code 1
+
+    - step: &Build_and_push_image
+        name: Build and Push Docker Image to aws ECR
+        runs-on: [self.hosted, linux.shell, devrunner]
+        # services:
+        #   - docker
+        script:
+          - set -euo pipefail
+          - echo "verify tools"
+          - unset DOCKER_HOST
+          - echo "authenticating Docker to push image to AWS ECR register"
+          - aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+          - echo "Buiding Docker image"
+          - export DOCKER_BUILDKIT=0
+          - docker build --build-arg APP_VERSION=${BITBUCKET_TAG} -t tasky:${BITBUCKET_TAG} .
+          - echo "tagging image"
+          - docker tag tasky:${BITBUCKET_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_REPOSITORY_NAME}:${BITBUCKET_TAG}
+          - echo "pushing image to AWS_ECR register"
+          - docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_REPOSITORY_NAME}:${BITBUCKET_TAG}
+
+    - step: &Deploy-application
+        name: Tasky app deployment 
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "authenticat into cluster"
+          - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+          - echo "carryingout autoscaler job"
+          - kubectl apply -f kubernetes/cluster-autoscaler-rbac.yaml
+          - envsubst < kubernetes/cluster-autoscaler.yml | kubectl apply -f -
+          - kubectl rollout status deployment/cluster-autoscaler -n kube-system --timeout=180s
+          - kubectl wait pod --all --for=condition=Ready --namespace=kube-system --timeout=60s
+          - kubectl get pods -n kube-system
+          - echo "apply namespace"
+          - kubectl apply -f kubernetes/namespace.yaml
+          - echo "Retrieve secret from aws secret manager"
+          - SECRET=$(aws secretsmanager get-secret-value --secret-id ${SECRET_REPOSITORY_NAME} --region "${AWS_REGION}" --query SecretString --output text)
+          - USERNAME=$(echo $SECRET | jq -r .username)
+          - PASSWORD=$(echo $SECRET | jq -r .password)
+          - export USERNAME
+          - export PASSWORD
+          - export MONGODB_PRIVATE_IP
+          - envsubst < kubernetes/secret.yaml | kubectl apply -f -
+          - echo "Deploy application"
+          - envsubst < kubernetes/deployment.yaml | kubectl apply -f -
+          - envsubst < kubernetes/service.yaml | kubectl apply -f -
+          - kubectl rollout status deployment/tasky-deployment -n production --timeout=180s
+          - kubectl wait pod --all --for=condition=Ready --namespace=production --timeout=60s
+          - echo "get pods status"
+          - kubectl get pods -n production
+          - echo "get service external IP"
+          - kubectl get svc -n production
+          - echo "Update deployment image with the new tag"
+          - kubectl set image deployment/tasky-deployment -n production tasky-container=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${AWS_ECR_REPOSITORY_NAME}:${BITBUCKET_TAG}
+          - echo "annotating the Deployment"
+          - kubectl annotate deployment/tasky-deployment -n production kubernetes.io/change-cause=${BITBUCKET_TAG}
+          
+    - step: &deployment-undo
+        name: update secret and restart deployment
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - kubectl rollout history deployment/tasky-deployment -n production
+          - kubectl rollout undo deployment/tasky-deployment -n production
+
+    - step: &update-secret-&-restart-deployment
+        name: update secret and restart deployment
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "authenticat into cluster"
+          - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+          - echo "Retrieve secret from aws secret manager"
+          - SECRET=$(aws secretsmanager get-secret-value --secret-id ${SECRET_REPOSITORY_NAME} --region ${AWS_REGION} --query SecretString --output text)
+          - USERNAME=$(echo $SECRET | jq -r .username)
+          - PASSWORD=$(echo $SECRET | jq -r .password)
+          - echo "update secret"
+          - MONGODB_URI="mongodb://${USERNAME}:${PASSWORD}@${MONGODB_PRIVATE_IP}:27017/mongodb-user?authSource=admin"
+          - |
+            kubectl create secret generic mongodb-user \
+              --from-literal=MONGODB_URI="$MONGODB_URI" \
+              -n production \
+              --dry-run=client -o yaml | kubectl apply -f -
+          - echo "Restart deployment"
+          - kubectl rollout restart deployment/cluster-autoscaler -n kube-system
+          - kubectl rollout restart deployment/tasky-deployment -n production
+
+    - step: &Destroy-application
+        name: To destroy tasky app 
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Configure kubectl to Talk to Cluster "
+          - aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}
+          - echo "delete service"
+          - kubectl delete svc tasky -n production
+          - echo "delete deployment"
+          - kubectl delete deployment tasky-deployment -n production
+          - echo "delete secret"
+          - kubectl delete secret mongodb-user -n production
+          - echo "delete namespace"
+          - kubectl delete namespace production
+          - kubectl delete deployment cluster-autoscaler -n kube-system
+          - kubectl delete ServiceAccount cluster-autoscaler -n kube-system
+          - kubectl delete clusterrole cluster-autoscaler
+
+    - step: &db_backup
+        name: tasky app database back-up
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Retrieve secret from aws secret manager"
+          - SECRET=$(aws secretsmanager get-secret-value --secret-id ${SECRET_REPOSITORY_NAME} --region ${AWS_REGION} --query SecretString --output text)
+          - USERNAME=$(echo $SECRET | jq -r .username)
+          - PASSWORD=$(echo $SECRET | jq -r .password)
+          - echo "Do this job"
+          - |
+            COMMAND_ID=$(aws ssm send-command --instance-ids "${MONGODB_INSTANCE_ID}" \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands="[\"sudo mkdir -p /tmp/db-backup\",\"sudo mongodump --db go-mongodb --uri=mongodb://${USERNAME}:${PASSWORD}@${MONGODB_PRIVATE_IP}:27017/go-mongodb?authSource=admin --out /tmp/db-backup\",\"aws s3 sync /tmp/db-backup s3://${DB_S3_BUCKET}\"]" \
+              --region "${AWS_REGION}" \
+              --query "Command.CommandId" \
+              --output text)
+          - echo "Let me know when done"
+          - aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "${MONGODB_INSTANCE_ID}" --region "${AWS_REGION}"
+          - echo "Show me the result"
+          - aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${MONGODB_INSTANCE_ID}" --region "${AWS_REGION}"
+
+    - step: &db_restore
+        name: tasky app database restore
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Retrieve secret from aws secret manager"
+          - SECRET=$(aws secretsmanager get-secret-value --secret-id ${SECRET_REPOSITORY_NAME} --region ${AWS_REGION} --query SecretString --output text)
+          - USERNAME=$(echo $SECRET | jq -r .username)
+          - PASSWORD=$(echo $SECRET | jq -r .password)
+          - echo "update secret"
+          - echo "Do this job"
+          - |
+            COMMAND_ID=$(aws ssm send-command --instance-ids "${MONGODB_INSTANCE_ID}" \
+              --document-name "AWS-RunShellScript" \
+              --parameters commands="[\"sudo mkdir -p /tmp/db-restore\",\"aws s3 sync s3://${DB_S3_BUCKET} /tmp/db-restore\",\"sudo mongorestore --uri=mongodb://${USERNAME}:${PASSWORD}@${MONGODB_PRIVATE_IP}:27017/?authSource=admin /tmp/db-restore\"]" \
+              --region "${AWS_REGION}" \
+              --query "Command.CommandId" \
+              --output text)
+          - echo "Let me know when done"
+          - aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "${MONGODB_INSTANCE_ID}" --region "${AWS_REGION}"
+          - echo "Show me the result"
+          - aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${MONGODB_INSTANCE_ID}" --region "${AWS_REGION}"
+          - echo "Restart deployment"
+          - kubectl rollout restart deployment/tasky-deployment -n production
+
+    - step: &kubernetes-monitoring-deployment
+        name: kubernetes-cluster-monitoring-deployment
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - echo "Create namespace for monitoring"
+          - kubectl create namespace monitoring
+          - echo "Add Helm Repo"
+          - helm repo add prometheus-community https://prometheus-community.github.io/helm-charts 
+          - echo "Update the repo"
+          - helm repo update
+          - echo "Deploy the Stack"
+          # helm upgrade --install <RELEASE_NAME> <REPO>/<CHART> --namespace <NAMESPACE
+          - helm upgrade --install observability prometheus-community/kube-prometheus-stack -n monitoring
+          - kubectl wait pod --all --for=condition=Ready --namespace=monitoring --timeout=600s
+          - echo "Wait until all pods show"
+          - kubectl get pods -n monitoring
+
+pipelines:
+  pull-requests:
+    "**":
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+
+  tags:
+    "v*":
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+      - step: *Build_and_push_image
+      - step: *Deploy-application
+
+  custom:
+    update-apllication-secret:
+      - step: *update-secret-&-restart-deployment
+
+    Destroy-application:
+      - step: *Destroy-application
+    
+    rollback-deployment:
+      - step: *deployment-undo
+
+    Deploy-k8s-monitoring:
+      - step: *kubernetes-monitoring-deployment
+
+    db_backup:
+      - step: *db_backup
+  
+    db_restore:
+      - step: *db_restore

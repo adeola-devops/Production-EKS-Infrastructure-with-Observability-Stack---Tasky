@@ -1,0 +1,92 @@
+options:
+  max-time: 60
+
+definitions:
+  steps:
+    - step: &trivy-scan
+        name: Trivy Scan
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - echo "Running Trivy scan"
+          - cd "$BITBUCKET_CLONE_DIR"
+          - echo $PATH
+          # - which trivy
+          - whoami
+          - id
+          - /usr/bin/trivy fs --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 .
+
+    - step: &gitleaks-scan
+        name: GitLeaks Secret Scan
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -e pipefail
+          - echo "Running GitLeaks secrets scan"
+          - cd "$BITBUCKET_CLONE_DIR"
+          - |
+            /usr/local/bin/gitleaks detect \
+              --source . \
+              --no-git \
+              --redact \
+              --verbose \
+              --exit-code 1
+
+    - step: &terraform-deploy
+        name: Terraform Checks
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -e pipefail
+          - cd "$BITBUCKET_CLONE_DIR"
+          - terraform --version
+          - which terraform
+          - export TF_INPUT=false
+          - echo "Initializing Terraform backend"
+          - terraform init -reconfigure -backend-config="bucket=${AWS_S3_BUCKET}" -backend-config="key=${AWS_S3_BUCKET_KEY}" -backend-config="region=${AWS_REGION}"
+
+          - echo "Checking Terraform formatting"
+          - echo "creating ssh key"
+          - mkdir -p keys
+          - echo "$SSH_PUBLIC_KEY" > keys/mfp-key.pub
+          - chmod 600 keys/mfp-key.pub
+
+          - echo "Running Terraform plan"
+          - terraform plan
+          - terraform apply -input=false -auto-approve
+
+    - step: &terraform-destroy
+        name: Terraform destroy
+        runs-on: [self.hosted, linux.shell, devrunner]
+        script:
+          - set -euo pipefail
+          - cd "$BITBUCKET_CLONE_DIR"
+          - export TF_INPUT=false
+          - echo "Initializing Terraform backend"
+          - terraform init -reconfigure -backend-config="bucket=${AWS_S3_BUCKET}" -backend-config="key=${AWS_S3_BUCKET_KEY}" -backend-config="region=${AWS_REGION}"
+          - echo "creating ssh key"
+          - mkdir -p keys
+          - echo "$SSH_PUBLIC_KEY" > keys/mfp-key.pub
+          - echo "Applying Terraform changes"
+          - terraform destroy -input=false -auto-approve
+
+pipelines:
+
+  pull-requests:
+    "**":
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+
+  branch:  
+    "feature/development":
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+
+  custom:
+    Infrastructure-deployment:
+      - step: *trivy-scan
+      - step: *gitleaks-scan
+      - step:
+          <<: *terraform-deploy
+          name: Terraform Apply (Manual Approval)
+          trigger: manual
+
+    infrastructure-destroy:
+      - step: *terraform-destroy

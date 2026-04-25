@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tasky
+  namespace: production
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "Internet-facing"
+    service.beta.kubernetes.io/aws-load-balancer-ssl-cert: ${ACM_CERT_ARN}
+    service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "http"
+spec:
+  type: LoadBalancer
+  selector:
+    app: tasky
+    type: frontend
+  ports: 
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: 8080
+  - name: https
+    protocol: TCP
+    port: 443
+    targetPort: 8080
